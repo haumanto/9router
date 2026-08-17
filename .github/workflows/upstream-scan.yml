@@ -7,8 +7,11 @@ name: Upstream PR scan
 
 on:
   schedule:
-    # 07:00 UTC daily. Cron on GitHub fires on the DEFAULT branch only.
-    - cron: "0 7 * * *"
+    # 07:00 WIB (UTC+7) daily. GitHub cron only accepts UTC, so this is 00:00 UTC.
+    # WIB has no daylight saving, so the local time stays 07:00 year round.
+    # Cron fires on the DEFAULT branch only, and GitHub may delay a scheduled run
+    # by some minutes when its queues are busy.
+    - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
       force:
