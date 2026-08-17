@@ -1,0 +1,164 @@
+# Watches decolua/9router for new open pull requests and opens an issue here
+# summarising them. Runs in this fork only; it never writes to upstream.
+#
+# The point is not the list. It is the first section: pull requests touching
+# files this fork has patched, which is where a future rebase will hurt.
+name: Upstream PR scan
+
+on:
+  schedule:
+    # 07:00 UTC daily. Cron on GitHub fires on the DEFAULT branch only.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Report even when nothing is new"
+        type: boolean
+        default: false
+      baseline:
+        description: "Record every open PR as already seen, without a report. Run once to avoid a 300-PR first issue."
+        type: boolean
+        default: false
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: upstream-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/github-script@v7
+        env:
+          FORCE: ${{ inputs.force }}
+          BASELINE: ${{ inputs.baseline }}
+        with:
+          script: |
+            const fs = require("fs");
+
+            const UPSTREAM = { owner: "decolua", repo: "9router" };
+            const LABEL = "upstream-scan";
+            // Providers this fork actually routes to. Titles mentioning these are
+            // surfaced above the general noise.
+            const PROVIDERS = /opencode|ocg|codex|cx\/|deepseek|antigravity|gemini|openrouter|ollama/i;
+            // Core reliability words worth a look even on an unused provider.
+            const CORE = /stream|timeout|context|fallback|retry|429|50[234]|error|quota|token|combo/i;
+
+            const watched = fs.existsSync(".github/upstream-scan-watched-paths.txt")
+              ? fs.readFileSync(".github/upstream-scan-watched-paths.txt", "utf8")
+                  .split("\n").map(s => s.trim()).filter(s => s && !s.startsWith("#"))
+              : [];
+            core.info(`watching ${watched.length} patched paths`);
+
+            // Everything reported before, so a run only surfaces what is new.
+            const seen = new Set();
+            const prior = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              labels: LABEL, state: "all", per_page: 100,
+            });
+            for (const issue of prior) {
+              for (const m of (issue.body || "").matchAll(/upstream#(\d+)/g)) seen.add(Number(m[1]));
+            }
+            core.info(`${prior.length} previous scans, ${seen.size} PRs already reported`);
+
+            const open = await github.paginate(github.rest.pulls.list, {
+              ...UPSTREAM, state: "open", per_page: 100,
+            });
+            core.info(`${open.length} open upstream PRs`);
+
+            const fresh = open.filter(pr => !seen.has(pr.number));
+
+            // Baseline: record today's open PRs as seen so the first real scan
+            // reports only what appears afterwards, instead of the whole backlog.
+            if (process.env.BASELINE === "true") {
+              const numbers = open.map(pr => `upstream#${pr.number}`).join(" ");
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title: `Upstream PR scan — baseline (${open.length} PRs marked seen)`,
+                body: `Baseline run. The ${open.length} pull requests open upstream today are recorded as already seen, so later scans surface only what is genuinely new.\n\nNo review implied — this is a starting line, not an endorsement.\n\n<details><summary>numbers recorded</summary>\n\n${numbers}\n\n</details>`,
+                labels: [LABEL],
+              });
+              core.info(`baseline recorded ${open.length} PRs`);
+              return;
+            }
+
+            if (fresh.length === 0 && process.env.FORCE !== "true") {
+              core.info("nothing new — not opening an issue");
+              return;
+            }
+
+            // Only the new ones cost an API call for their file list.
+            const rows = [];
+            for (const pr of fresh) {
+              let files = [];
+              try {
+                files = await github.paginate(github.rest.pulls.listFiles, {
+                  ...UPSTREAM, pull_number: pr.number, per_page: 100,
+                });
+              } catch (e) {
+                core.warning(`#${pr.number}: could not list files (${e.message})`);
+              }
+              const paths = files.map(f => f.filename);
+              const clash = paths.filter(p => watched.includes(p));
+              rows.push({
+                n: pr.number, title: pr.title, author: pr.user?.login || "?",
+                url: pr.html_url, add: pr.additions, del: pr.deletions,
+                files: paths.length, clash,
+              });
+            }
+
+            const line = r =>
+              `- **[upstream#${r.n}](${r.url})** \`+${r.add ?? "?"}/-${r.del ?? "?"}\` by @${r.author}` +
+              `\n  ${r.title}` +
+              (r.clash.length ? `\n  ⚠️ touches ${r.clash.length} patched file${r.clash.length > 1 ? "s" : ""}: ${r.clash.map(f => `\`${f}\``).join(", ")}` : "");
+
+            const clashing = rows.filter(r => r.clash.length);
+            const relevant = rows.filter(r => !r.clash.length && PROVIDERS.test(r.title));
+            const core_ = rows.filter(r => !r.clash.length && !PROVIDERS.test(r.title) && CORE.test(r.title));
+            const rest = rows.filter(r => !clashing.includes(r) && !relevant.includes(r) && !core_.includes(r));
+
+            // Cap each section, but say so. A silent truncation reads as
+            // "that is all of them" when it is not.
+            const CAP = 15;
+            const section = (title, list, note) => {
+              if (!list.length) return "";
+              const shown = list.slice(0, CAP);
+              const omitted = list.length - shown.length;
+              return `\n## ${title} (${list.length})\n${note ? `\n${note}\n` : ""}\n${shown.map(line).join("\n")}\n` +
+                (omitted ? `\n<sub>${omitted} more not shown — raise \`CAP\` in the workflow to see them all.</sub>\n` : "");
+            };
+
+            const body = [
+              `${fresh.length} new open pull request${fresh.length === 1 ? "" : "s"} upstream since the last scan.`,
+              `Scanned ${open.length} open PRs against ${watched.length} locally patched files.`,
+              section("Touches files this fork has patched", clashing,
+                "These are the ones that will conflict on a rebase. Read these first."),
+              section("Providers this fork uses", relevant),
+              section("Core reliability", core_),
+              section("Everything else", rest),
+              `\n---\n<sub>Generated by \`.github/workflows/upstream-scan.yml\`. Watched paths live in \`.github/upstream-scan-watched-paths.txt\` — regenerate with \`git diff --name-only origin/master..<your-branch>\`.</sub>`,
+            ].join("\n");
+
+            // The label has to exist before it can be applied.
+            try {
+              await github.rest.issues.getLabel({ owner: context.repo.owner, repo: context.repo.repo, name: LABEL });
+            } catch {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner, repo: context.repo.repo,
+                name: LABEL, color: "0e8a16", description: "Automated upstream pull request scan",
+              });
+            }
+
+            const stamp = new Date().toISOString().slice(0, 10);
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: `Upstream PR scan — ${stamp} (${clashing.length} touching patched files)`,
+              body, labels: [LABEL],
+            });
+            core.info(`opened ${issue.data.html_url}`);
